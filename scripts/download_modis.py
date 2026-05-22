@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import datetime as dt
 import logging
 import os
@@ -33,15 +34,14 @@ def load_config(config_path: Path) -> Dict:
         return yaml.safe_load(handle)
 
 
-def iter_month_ranges(years: Iterable[int], months: Iterable[int]) -> Iterable[DateRange]:
+def iter_day_ranges(years: Iterable[int], months: Iterable[int]) -> Iterable[DateRange]:
     for year in years:
         for month in months:
-            start = dt.datetime(year, month, 1, 0, 0, 0)
-            if month == 12:
-                end = dt.datetime(year + 1, 1, 1, 0, 0, 0)
-            else:
-                end = dt.datetime(year, month + 1, 1, 0, 0, 0)
-            yield DateRange(start=start, end=end)
+            _, days_in_month = calendar.monthrange(year, month)
+            for day in range(1, days_in_month + 1):
+                start = dt.datetime(year, month, day, 0, 0, 0)
+                end = start + dt.timedelta(days=1)
+                yield DateRange(start=start, end=end)
 
 
 def cmr_search(short_name: str, roi: Dict[str, float], date_range: DateRange, page_size: int = 2000) -> List[Dict]:
@@ -66,7 +66,7 @@ def pick_data_link(entry: Dict) -> str | None:
             continue
         rel = link.get("rel", "")
         title = (link.get("title") or "").lower()
-        if "data#" in rel or "download" in title or href.endswith((".hdf", ".h5", ".nc")):
+        if ("data#" in rel or "download" in title) and href.lower().endswith(".hdf"):
             return href
     return None
 
@@ -105,7 +105,8 @@ def _download_product(
     overwrite: bool,
     dry_run: bool,
 ) -> Tuple[int, int]:
-    entries = cmr_search(short_name=short_name, roi=roi, date_range=date_range)
+    page_size = 1 if dry_run else 2000
+    entries = cmr_search(short_name=short_name, roi=roi, date_range=date_range, page_size=page_size)
     downloaded = 0
     skipped = 0
 
@@ -119,16 +120,18 @@ def _download_product(
         granule_time = parse_granule_time(entry)
         destination = output_path(base_path=base_path, granule_time=granule_time, filename=filename)
 
-        if dry_run:
-            LOGGER.info("[DRY-RUN] %s -> %s", url, destination)
-            continue
-
         try:
             download_file(url=url, token=token, destination=destination, overwrite=overwrite)
             downloaded += 1
+            if dry_run:
+                LOGGER.info("[DRY-RUN] sampled %s -> %s", url, destination)
+                break
         except requests.RequestException as exc:
             skipped += 1
             LOGGER.warning("Failed download %s (%s)", url, exc)
+
+        if dry_run:
+            break
 
     return downloaded, skipped
 
@@ -136,7 +139,7 @@ def _download_product(
 def run_download(config: Dict, dry_run: bool = False) -> None:
     token_env_var = config["auth"]["earthdata_token_env"]
     token = os.getenv(token_env_var)
-    if not token and not dry_run:
+    if not token:
         raise RuntimeError(f"Missing Earthdata token in env var: {token_env_var}")
 
     roi = config["roi"]
@@ -147,7 +150,11 @@ def run_download(config: Dict, dry_run: bool = False) -> None:
     radiance_base = Path(config["download"]["radiance_base_path"])
     cloud_base = Path(config["download"]["cloud_mask_base_path"])
 
-    for date_range in iter_month_ranges(years=years, months=months):
+    date_ranges = iter_day_ranges(years=years, months=months)
+    if dry_run:
+        date_ranges = list(date_ranges)[:1]
+
+    for date_range in date_ranges:
         for satellite, products in PRODUCTS.items():
             l1_product = products["l1"]
             l2_product = products["l2"]

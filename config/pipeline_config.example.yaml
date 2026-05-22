@@ -5,7 +5,7 @@ auth:
 
 # Period selection
 years: [2024]
-months: [4, 5, 6, 7, 8, 9]
+months: [4]#, 5, 6, 7, 8, 9]
 
 # ROI (Europe)
 roi:
@@ -22,12 +22,12 @@ overwrite: false
 
 download:
   # Terra + Aqua L1 radiance files are stored together in the same day folder structure.
-  radiance_base_path: /data/modis/raw/radiances
+  radiance_base_path: /sat_data/modis/raw/radiances
   # Cloud mask files are stored in a separate base path with the same day folder structure.
-  cloud_mask_base_path: /data/modis/raw/cloud_mask
+  cloud_mask_base_path: /sat_data/modis/raw/cloud_mask
 
 processing:
-  output_base_path: /data/modis/processed
+  output_base_path: /sat_data/modis/processed
 
 upload:
   # Optional prefix in the destination bucket

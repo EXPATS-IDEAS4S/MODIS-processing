@@ -16,6 +16,14 @@ Scripts for downloading and processing MODIS Terra/Aqua L1 radiances and L2 clou
     - `ir_105` -> MODIS band 31
     - `wv_63` -> MODIS band 27
   - Reads L2 cloud mask with Satpy reader `modis_l2` and writes BT + cloud mask into one NetCDF per overpass.
+  - Processing options (config-driven):
+    - `processing.resample` (bool): when true, resample both L1 BT and L2 cloud mask to a regular latitude/longitude grid covering the configured ROI. When false, use the L1 native grid as the common target and regrid L2 to L1.
+    - `processing.target_resolution_deg` (float): grid spacing in degrees when `resample=true` (default `0.01`).
+    - `processing.output_base_path`: output folder base for NetCDF files.
+  - Output contents and format:
+    - The produced NetCDF contains only the two BT variables (one per configured channel), `cloud_mask`, and 2D coordinates `latitude` and `longitude` (dims `y,x`).
+    - Missing/outside-swath points are represented as `NaN` on the target grid (cloud_mask stored as float to allow NaN). If you prefer integer mask + fill value, adjust the script.
+    - Files are written with NetCDF compression (`zlib=True`, `complevel=9`).
   - Output folder structure is `year/month/day`.
 
 - `scripts/upload_s3.py`
@@ -49,6 +57,10 @@ Example includes:
 - years: `[2024]`
 - months: `[4, 5, 6, 7, 8, 9]`
 
+New processing keys (added):
+- `processing.resample`: true|false — whether to resample to a regular lat/lon grid (default: true)
+- `processing.target_resolution_deg`: grid spacing in degrees when resampling (default: 0.01)
+
 3. Set Earthdata token:
 
 ```bash
@@ -80,6 +92,12 @@ python scripts/download_modis.py --config config/pipeline_config.yaml --dry-run
 
 ```bash
 python scripts/process_modis.py --config config/pipeline_config.yaml
+```
+
+Dry run (process only first available day):
+
+```bash
+python scripts/process_modis.py --config config/pipeline_config.yaml --dry-run
 ```
 
 ### 3) Upload only
@@ -129,3 +147,9 @@ python scripts/debug_tools.py verify-s3 --local-base /data/modis/processed --cre
   - `modis_l2` for MOD35 cloud-mask products
 - Download script uses NASA CMR search API and then downloads returned data links.
 - Because product providers can change link metadata, test with `--dry-run` first.
+ 
+Additional notes on processing behavior and dependencies:
+- The processor prefers to use the native geolocation (latitude/longitude) returned by Satpy for each granule. If L1 geolocation is missing for a granule it will currently be skipped and a warning logged; we can enable fallback to L2 geolocation if desired.
+- Regridding is implemented using `scipy.interpolate.griddata` as a generic fallback for 2D geolocation. For best performance on swath-to-grid resampling, installing `pyresample` is recommended — the code will attempt to use pyresample where available in the future.
+- The Satpy readers require HDF4 support (`pyhdf`) in the Python environment. Ensure your `satpy` conda env includes `pyhdf` (and `scipy` for resampling).
+- NetCDF files are written with compression level 9 to reduce disk and upload bandwidth.
