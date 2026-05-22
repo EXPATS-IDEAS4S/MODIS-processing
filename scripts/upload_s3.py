@@ -93,7 +93,7 @@ def run_upload(config: Dict, credentials_path: Path, verify: bool = False, dry_r
         key = f"{bucket_prefix}/{rel_path}" if bucket_prefix else rel_path
 
         if dry_run:
-            LOGGER.info("[DRY-RUN] upload %s -> s3://%s/%s", file_path, creds["bucket"], key)
+            LOGGER.info("[DRY-RUN] upload %s -> s3://<bucket>/%s", file_path, key)
             continue
 
         if upload_file(s3_client=s3_client, file_path=file_path, bucket=creds["bucket"], object_key=key):
@@ -101,7 +101,7 @@ def run_upload(config: Dict, credentials_path: Path, verify: bool = False, dry_r
             if verify and not verify_uploaded(s3_client=s3_client, bucket=creds["bucket"], key=key):
                 LOGGER.warning("Uploaded object not found during verification: %s", key)
 
-    LOGGER.info("Uploaded %s files to bucket %s", uploaded, creds["bucket"])
+    LOGGER.info("Uploaded %s files", uploaded)
 
 
 def parse_args() -> argparse.Namespace:
