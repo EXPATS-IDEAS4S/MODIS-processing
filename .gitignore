@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Local configs/secrets
+config/pipeline_config.yaml
+s3_credentials.py
+
+# Outputs
+plots/

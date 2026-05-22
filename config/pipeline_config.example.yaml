@@ -1,0 +1,42 @@
+# Copy to config/pipeline_config.yaml and edit values.
+
+auth:
+  earthdata_token_env: EARTHDATA_TOKEN
+
+# Period selection
+years: [2024]
+months: [4, 5, 6, 7, 8, 9]
+
+# ROI (Europe)
+roi:
+  lon_min: -10
+  lat_min: 35
+  lon_max: 30
+  lat_max: 56
+
+# Target channels nearest to 10.5 µm and 6.3 µm
+channels: ["ir_105", "wv_63"]
+
+# Overwrite existing files when true
+overwrite: false
+
+download:
+  # Terra + Aqua L1 radiance files are stored together in the same day folder structure.
+  radiance_base_path: /data/modis/raw/radiances
+  # Cloud mask files are stored in a separate base path with the same day folder structure.
+  cloud_mask_base_path: /data/modis/raw/cloud_mask
+
+processing:
+  output_base_path: /data/modis/processed
+
+upload:
+  # Optional prefix in the destination bucket
+  bucket_prefix: modis/processed
+
+pipeline:
+  run_download: true
+  run_processing: true
+  run_upload: true
+  verify_upload: true
+  delete_raw_after_processing: false
+  delete_processed_after_upload: false
