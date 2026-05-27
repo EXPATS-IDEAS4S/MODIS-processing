@@ -22,6 +22,8 @@ PRODUCTS = {
     "aqua": {"l1": "MYD021KM", "l2": "MYD35_L2"},
 }
 
+VALID_EXTENSIONS = {"hdf", "nc"}
+
 
 @dataclass(frozen=True)
 class DateRange:
@@ -57,7 +59,11 @@ def cmr_search(short_name: str, roi: Dict[str, float], date_range: DateRange, pa
     return response.json().get("feed", {}).get("entry", [])
 
 
-def pick_data_link(entry: Dict) -> str | None:
+def pick_data_link(entry: Dict, extension: str = "hdf") -> str | None:
+    ext = extension.lower().lstrip(".")
+    if ext not in VALID_EXTENSIONS:
+        raise ValueError(f"Unsupported extension '{extension}'. Supported: {sorted(VALID_EXTENSIONS)}")
+
     for link in entry.get("links", []):
         href = link.get("href")
         if not href:
@@ -66,7 +72,7 @@ def pick_data_link(entry: Dict) -> str | None:
             continue
         rel = link.get("rel", "")
         title = (link.get("title") or "").lower()
-        if ("data#" in rel or "download" in title) and href.lower().endswith(".hdf"):
+        if ("data#" in rel or "download" in title) and href.lower().endswith(f".{ext}"):
             return href
     return None
 
@@ -104,6 +110,7 @@ def _download_product(
     token: str,
     overwrite: bool,
     dry_run: bool,
+    extension: str,
 ) -> Tuple[int, int]:
     page_size = 1 if dry_run else 2000
     entries = cmr_search(short_name=short_name, roi=roi, date_range=date_range, page_size=page_size)
@@ -111,7 +118,7 @@ def _download_product(
     skipped = 0
 
     for entry in entries:
-        url = pick_data_link(entry)
+        url = pick_data_link(entry, extension=extension)
         if not url:
             skipped += 1
             continue
@@ -149,6 +156,8 @@ def run_download(config: Dict, dry_run: bool = False) -> None:
 
     radiance_base = Path(config["download"]["radiance_base_path"])
     cloud_base = Path(config["download"]["cloud_mask_base_path"])
+    l1_extension = config["download"].get("l1_extension", "hdf")
+    l2_extension = config["download"].get("l2_extension", "hdf")
 
     date_ranges = iter_day_ranges(years=years, months=months)
     if dry_run:
@@ -166,6 +175,7 @@ def run_download(config: Dict, dry_run: bool = False) -> None:
                 token=token or "",
                 overwrite=overwrite,
                 dry_run=dry_run,
+                extension=l1_extension,
             )
             l2_downloaded, l2_skipped = _download_product(
                 short_name=l2_product,
@@ -175,6 +185,7 @@ def run_download(config: Dict, dry_run: bool = False) -> None:
                 token=token or "",
                 overwrite=overwrite,
                 dry_run=dry_run,
+                extension=l2_extension,
             )
             LOGGER.info(
                 "%s [%s - %s] L1 downloaded=%s skipped=%s | L2 downloaded=%s skipped=%s",
