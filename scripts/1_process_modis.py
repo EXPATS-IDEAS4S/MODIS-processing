@@ -1,5 +1,50 @@
 #!/usr/bin/env python3
-"""Process downloaded MODIS files to BT and cloud-mask NetCDF outputs."""
+"""
+Process downloaded MODIS L1/L2 files into brightness-temperature (BT)
+and cloud-mask NetCDF outputs.
+
+This script scans directories of downloaded MODIS L1 radiance files and
+corresponding L2 cloud-mask files, loads required bands, optionally
+regrids/resamples data to a regular lat/lon grid, applies cloud masks,
+and writes per-granule NetCDF files containing BT channels and a cloud
+mask variable.
+
+How to run
+-----------
+- Prepare a YAML pipeline config (see `config/pipeline_config.example.yaml`) and
+    set the following keys at minimum: `download.radiance_base_path`,
+    `download.cloud_mask_base_path`, `processing.output_base_path`, `channels`,
+    `years`, `months`.
+- Run from the repository root:
+
+        python scripts/process_modis.py --config config/pipeline_config.yaml
+
+- Useful flags:
+    - `--dry-run`: run without writing output (processes only the first day)
+    - `--log-level`: set logging verbosity (DEBUG/INFO/WARNING/ERROR)
+
+Config notes
+------------
+The script reads processing options from the `processing` section of the
+config, e.g. `target_resolution_deg`, `resample` (True/False),
+`combine_satellites`, `l1_reader`, `l2_reader`, `cloud_mask_channel`,
+`cloud_mask_binary`, `overwrite`, and `verbose`. See
+`config/pipeline_config.example.yaml` for defaults and examples.
+
+Output
+------
+Per-granule NetCDF files are written under the configured
+`processing.output_base_path` organized by YYYY/MM/DD and named like
+`YYYYMMDDTHHMM_modis_<sat>_<vars>.nc`.
+
+Notes for developers
+--------------------
+- The main entry points are `process_day()` (processes one day's
+    directories) and `run_processing()` (iterates configured days).
+- Many helpers are implemented in `scripts/utils/` (loaders, regrid,
+    cloudmask, netcdf utilities). Keep CLI/IO logic here and heavy
+    data-processing in the utils modules.
+"""
 
 from __future__ import annotations
 
@@ -21,340 +66,51 @@ CHANNEL_TO_BAND = {
     "wv_63": "27",
 }
 
+# Import utility helpers from scripts.utils
+from scripts.utils.io import (
+    load_config,
+    iter_days,
+    list_files,
+    _is_l1_file,
+    _is_l2_file,
+    _extract_granule_key,
+    _index_l2_files,
+    _satellite_from_name,
+)
 
-def _area_lonlats(data_array: xr.DataArray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    try:
-        lon, lat = data_array.attrs["area"].get_lonlats()
-        return np.asarray(lon), np.asarray(lat)
-    except Exception:
-        return None, None
+from scripts.utils.regrid import (
+    _regrid_to_target,
+    _resample_with_outside_nan,
+    _coverage_extent_from_points,
+    _coverage_extent_regular,
+)
 
+from scripts.utils.loaders import (
+    _area_lonlats,
+    _load_bt_datasets,
+    _load_cloud_mask,
+    _load_l2_with_geolocation,
+)
 
-def load_config(config_path: Path) -> Dict:
-    with config_path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+from scripts.utils.cloudmask import (_resolve_cloud_mask_name, _cloud_mask_to_binary_values)
 
+from scripts.utils.crop import (_largest_rectangle_from_mask, _crop_regular_dataset_to_valid_rectangle)
 
-def iter_days(base_path: Path, years: Iterable[int], months: Iterable[int]) -> Iterable[Path]:
-    for year in years:
-        for month in months:
-            month_dir = base_path / f"{year:04d}" / f"{month:02d}"
-            if not month_dir.exists():
-                continue
-            for day_dir in sorted([item for item in month_dir.iterdir() if item.is_dir()]):
-                yield day_dir
+from scripts.utils.time_utils import _parse_time_from_name
 
-
-def _is_l1_file(path: Path, satellite: str) -> bool:
-    prefix = SATELLITE_PREFIX[satellite]
-    return path.name.startswith(f"{prefix}021KM") and path.suffix.lower() in {".hdf", ".h5"}
-
-
-def _is_l2_file(path: Path, satellite: str) -> bool:
-    prefix = SATELLITE_PREFIX[satellite]
-    return path.name.startswith(f"{prefix}35_L2") and path.suffix.lower() in {".hdf", ".h5"}
-
-
-def list_files(radiance_day_dir: Path, cloud_day_dir: Path, satellite: Optional[str]) -> Tuple[List[Path], List[Path]]:
-    """List L1 and L2 files for a day. If `satellite` is None, include both terra and aqua."""
-    if satellite is None:
-        l1_files = sorted([item for item in radiance_day_dir.glob("*") if item.is_file() and any(_is_l1_file(item, s) for s in SATELLITE_PREFIX)])
-        l2_files = sorted([item for item in cloud_day_dir.glob("*") if item.is_file() and any(_is_l2_file(item, s) for s in SATELLITE_PREFIX)])
-    else:
-        l1_files = sorted([item for item in radiance_day_dir.glob("*") if item.is_file() and _is_l1_file(item, satellite)])
-        l2_files = sorted([item for item in cloud_day_dir.glob("*") if item.is_file() and _is_l2_file(item, satellite)])
-    return l1_files, l2_files
+from scripts.utils.netcdf_utils import safe_attr, prepare_netcdf_encoding
 
 
-def _extract_granule_key(path: Path) -> str:
-    parts = path.stem.split(".")
-    return "_".join(parts[1:3]) if len(parts) >= 3 else path.stem
-
-
-def _index_l2_files(l2_files: Iterable[Path]) -> Dict[str, Path]:
-    return {_extract_granule_key(path): path for path in l2_files}
-
-
-def _satellite_from_name(path: Path) -> Optional[str]:
-    name = path.name
-    for sat, prefix in SATELLITE_PREFIX.items():
-        if name.startswith(prefix):
-            return sat
-    return None
-
-
-def _resolve_cloud_mask_name(available: Iterable[str], preferred_name: Optional[str] = None) -> Optional[str]:
-    available_list = list(available)
-    preferred_names = []
-    if preferred_name:
-        preferred_names.append(preferred_name)
-        preferred_names.append(preferred_name.lower())
-        preferred_names.append(preferred_name.upper())
-    preferred_names.extend(["cloud_mask", "Cloud_Mask", "cloud_mask_byte_segment", "Integer_Cloud_Mask"])
-
-    for candidate in preferred_names:
-        if candidate in available_list:
-            return candidate
-
-    return next((name for name in available_list if "cloud" in name.lower()), None)
-
-
-def _cloud_mask_to_binary_values(values: np.ndarray, binary: bool) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float32)
-    if not binary:
-        return arr
-    mapped = np.full(arr.shape, np.nan, dtype=np.float32)
-    mapped[np.isin(arr, [0])] = 1.0
-    mapped[np.isin(arr, [1, 2, 3])] = 0.0
-    mapped[arr == -1] = np.nan
-    return mapped
-
-
-def _load_bt_datasets(l1_file: Path, channels: List[str], reader: str = "modis_l1b", area_def=None) -> Dict[str, xr.DataArray]:
-    band_names = [CHANNEL_TO_BAND[channel] for channel in channels]
-    queries = [DataQuery(name=band, calibration="brightness_temperature") for band in band_names]
-    scene = Scene(reader=reader, filenames=[str(l1_file)])
-    try:
-        scene.load(queries)
-    except Exception:
-        scene.load(list(queries))
-
-    data: Dict[str, xr.DataArray] = {}
-    # retrieve BT arrays
-    for channel, band, query in zip(channels, band_names, queries):
-        try:
-            bt = scene[query].astype(np.float32)
-        except Exception:
-            # try by band name as string
-            try:
-                bt = scene[band].astype(np.float32)
-            except Exception:
-                raise
-        data[f"bt_{channel}"] = bt.rename(f"bt_{channel}")
-        data[f"bt_{channel}"].attrs.update({"long_name": f"Brightness temperature channel {channel} (MODIS band {band})", "units": "K"})
-
-    # retrieve geolocation directly from the loaded scene data area metadata
-    geo_source = data.get(f"bt_{channels[0]}") if channels else None
-    if geo_source is not None:
-        lon, lat = _area_lonlats(geo_source)
-        if lat is not None and lon is not None:
-            data["latitude"] = xr.DataArray(lat, dims=geo_source.dims, coords=geo_source.coords).astype(np.float32)
-            data["longitude"] = xr.DataArray(lon, dims=geo_source.dims, coords=geo_source.coords).astype(np.float32)
-
-    return data
-
-
-def _load_cloud_mask(
-    l2_file: Path,
-    reader: str = "modis_l2",
-    cloud_mask_channel: Optional[str] = None,
-    cloud_mask_binary: bool = True,
-    area_def=None,
-) -> Optional[xr.DataArray]:
-    scene = Scene(reader=reader, filenames=[str(l2_file)])
-    try:
-        available = list(scene.available_dataset_names())
-    except Exception:
-        available = []
-
-    dataset_name = _resolve_cloud_mask_name(available, preferred_name=cloud_mask_channel)
-
-    if dataset_name is None:
-        return None
-
-    try:
-        # MODIS cloud mask in this pipeline should be taken at 1000 m resolution.
-        load_list = [DataQuery(name=dataset_name, resolution=1000)]
-        scene.load(load_list)
-        cloud_data = scene[DataQuery(name=dataset_name, resolution=1000)]
-    except Exception:
-        try:
-            scene.load([DataQuery(name=dataset_name, resolution=1000)])
-            cloud_data = scene[DataQuery(name=dataset_name, resolution=1000)]
-        except Exception:
-            return None
-
-    cloud_lon, cloud_lat = _area_lonlats(cloud_data)
-    #cloud_data_latlon = (cloud_lat, cloud_lon) if cloud_lat is not None and cloud_lon is not None else (None, None)
-
-    cloud_values = _cloud_mask_to_binary_values(cloud_data.values, cloud_mask_binary)
-    cloud_data = xr.DataArray(cloud_values, dims=cloud_data.dims, coords=cloud_data.coords, attrs=dict(cloud_data.attrs)).rename("cloud_mask")
-    cloud_data.attrs.update({"long_name": "MODIS cloud mask"})
-    # attach lat/lon pair as attribute for caller
-    #cloud_data.attrs["_latlon_pair"] = cloud_data_latlon
-    return cloud_data, cloud_lon, cloud_lat
-
-
-def _load_l2_with_geolocation(
-    l2_file: Path,
-    reader: str = "modis_l2",
-    cloud_mask_channel: Optional[str] = None,
-    cloud_mask_binary: bool = True,
-) -> Tuple[Optional[xr.DataArray], Optional[xr.DataArray], Optional[xr.DataArray]]:
-    """Load L2 cloud mask and return (cloud_mask, latitude, longitude) DataArrays when available.
-
-    Returns a tuple of (cloud_mask, lat, lon) where missing items are None.
-    """
-    scene = Scene(reader=reader, filenames=[str(l2_file)])
-    try:
-        available = list(scene.available_dataset_names())
-    except Exception:
-        available = []
-
-    # pick cloud mask dataset name
-    cloud_name = _resolve_cloud_mask_name(available, preferred_name=cloud_mask_channel)
-    if cloud_name is None:
-        return None, None, None
-
-    load_list = [DataQuery(name=cloud_name, resolution=1000)]
-
-    try:
-        scene.load(load_list)
-    except Exception:
-        scene.load([DataQuery(name=cloud_name)])
-
-    try:
-        cloud = scene[DataQuery(name=cloud_name, resolution=1000)]
-    except Exception:
-        try:
-            cloud = scene[DataQuery(name=cloud_name, resolution=1000)]
-        except Exception:
-            cloud = None
-
-    if cloud is not None:
-        cloud = xr.DataArray(
-            _cloud_mask_to_binary_values(cloud.values, cloud_mask_binary),
-            dims=cloud.dims,
-            coords=cloud.coords,
-            attrs=dict(cloud.attrs),
-        ).rename("cloud_mask")
-
-    lon_values, lat_values = _area_lonlats(cloud)
-    lat = xr.DataArray(lat_values, dims=cloud.dims, coords=cloud.coords) if lat_values is not None else None
-    lon = xr.DataArray(lon_values, dims=cloud.dims, coords=cloud.coords) if lon_values is not None else None
-
-    return cloud, lat, lon
-
-
-def _parse_time_from_name(path: Path) -> dt.datetime:
-    parts = path.stem.split(".")
-    # Example: MOD021KM.A2024123.1050.061.2024123133333
-    if len(parts) < 3:
-        return dt.datetime.utcnow()
-    julian = parts[1][1:]
-    hhmm = parts[2]
-    year = int(julian[:4])
-    doy = int(julian[4:])
-    hour = int(hhmm[:2])
-    minute = int(hhmm[2:4])
-    return dt.datetime(year, 1, 1, hour=hour, minute=minute) + dt.timedelta(days=doy - 1)
-
-
-def _regrid_to_target(
-    src_da: xr.DataArray,
-    src_lon: np.ndarray,
-    src_lat: np.ndarray,
-    target_lon: np.ndarray,
-    target_lat: np.ndarray,
-    method: str = "linear",
-    chunk_rows: Optional[int] = None,
-) -> xr.DataArray:
-    """Regrid a 2D DataArray given source lon/lat and target lon/lat (2D).
-
-    Uses scipy.interpolate.griddata. Returns DataArray with dims ('y','x')
-    and coords 'latitude' and 'longitude'.
-    """
-    try:
-        from scipy.interpolate import griddata
-    except Exception as e:
-        raise RuntimeError("scipy is required for 2D geolocation regridding: install scipy")
-
-    # ensure numpy arrays
-    src_lon_a = np.asarray(src_lon)
-    src_lat_a = np.asarray(src_lat)
-    vals = src_da.values
-
-    # flatten source points
-    points = np.column_stack((src_lon_a.ravel(), src_lat_a.ravel()))
-    values = vals.ravel()
-
-    # target grids
-    tgt_lon = np.asarray(target_lon)
-    tgt_lat = np.asarray(target_lat)
-
-    # If chunk_rows is provided and target is 2D, process the target in row-chunks
-    if chunk_rows and tgt_lat.ndim == 2:
-        rows = tgt_lat.shape[0]
-        pieces = []
-        for start in range(0, rows, chunk_rows):
-            stop = min(start + chunk_rows, rows)
-            sub_lon = tgt_lon[start:stop, :]
-            sub_lat = tgt_lat[start:stop, :]
-            grid_z_sub = griddata(points, values, (sub_lon, sub_lat), method=method, fill_value=np.nan)
-            pieces.append(grid_z_sub)
-        grid_z = np.vstack(pieces)
-    else:
-        # griddata expects (nx, ny) matching meshgrid order; provide (lon, lat)
-        grid_z = griddata(points, values, (tgt_lon, tgt_lat), method=method, fill_value=np.nan)
-
-    da = xr.DataArray(grid_z.astype(values.dtype), dims=("y", "x"))
-    da = da.assign_coords({"latitude": (("y", "x"), tgt_lat), "longitude": (("y", "x"), tgt_lon)})
-    return da
-
-
-def _resample_with_outside_nan(
-    src_da: xr.DataArray,
-    src_lon: np.ndarray,
-    src_lat: np.ndarray,
-    target_lon: np.ndarray,
-    target_lat: np.ndarray,
-    method: str = "linear",
-    chunk_rows: Optional[int] = None,
-) -> xr.DataArray:
-    regridded = _regrid_to_target(src_da, src_lon, src_lat, target_lon, target_lat, method=method, chunk_rows=chunk_rows)
-    if method == "nearest":
-        coverage = _regrid_to_target(
-            xr.DataArray(np.ones_like(np.asarray(src_da.values), dtype=np.float32), dims=src_da.dims),
-            src_lon,
-            src_lat,
-            target_lon,
-            target_lat,
-            method="linear",
-            chunk_rows=chunk_rows,
-        )
-        regridded = regridded.where(np.isfinite(coverage))
-    return regridded
-
-
-def _coverage_extent_regular(valid_mask: np.ndarray, lon_1d: np.ndarray, lat_1d: np.ndarray) -> Tuple[float, float]:
-    ys, xs = np.where(valid_mask)
-    if ys.size == 0 or xs.size == 0:
-        return 0.0, 0.0
-    lon_vals = np.asarray(lon_1d)
-    lat_vals = np.asarray(lat_1d)
-    lon_res = abs(float(lon_vals[1] - lon_vals[0])) if lon_vals.size > 1 else 0.0
-    lat_res = abs(float(lat_vals[1] - lat_vals[0])) if lat_vals.size > 1 else 0.0
-    lon_extent = float(np.nanmax(lon_vals[xs]) - np.nanmin(lon_vals[xs]) + lon_res)
-    lat_extent = float(np.nanmax(lat_vals[ys]) - np.nanmin(lat_vals[ys]) + lat_res)
-    return lon_extent, lat_extent
-
-
-def _coverage_extent_from_points(lon: np.ndarray, lat: np.ndarray, roi: Dict[str, float]) -> Tuple[float, float]:
-    lon_arr = np.asarray(lon)
-    lat_arr = np.asarray(lat)
-    valid = np.isfinite(lon_arr) & np.isfinite(lat_arr)
-    if roi:
-        valid &= (
-            (lon_arr >= float(roi.get("lon_min", -180.0)))
-            & (lon_arr <= float(roi.get("lon_max", 180.0)))
-            & (lat_arr >= float(roi.get("lat_min", -90.0)))
-            & (lat_arr <= float(roi.get("lat_max", 90.0)))
-        )
-    if not np.any(valid):
-        return 0.0, 0.0
-    lon_vals = lon_arr[valid]
-    lat_vals = lat_arr[valid]
-    return float(np.nanmax(lon_vals) - np.nanmin(lon_vals)), float(np.nanmax(lat_vals) - np.nanmin(lat_vals))
+# Helper functions moved to scripts/utils/* modules
+# Cloud mask helpers moved to scripts/utils/cloudmask.py
+# BT loader moved to scripts/utils/loaders.py
+# Cloud mask loader moved to scripts/utils/loaders.py
+# L2 loader with geolocation moved to scripts/utils/loaders.py
+# Time parsing moved to scripts/utils/time_utils.py
+# `_regrid_to_target` moved to scripts/utils/regrid.py
+# `_resample_with_outside_nan` moved to scripts/utils/regrid.py
+# `_coverage_extent_regular` moved to scripts/utils/regrid.py
+# `_coverage_extent_from_points` moved to scripts/utils/regrid.py
 
 
 def _largest_rectangle_from_mask(valid_mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
@@ -503,6 +259,8 @@ def process_day(
     overwrite: bool = False,
     resample_chunk_rows: Optional[int] = None,
     coord_decimals: Optional[int] = None,
+    parallel: bool = False,
+    workers: int = 1,
 ) -> int:
     l1_files, l2_files = list_files(radiance_day_dir=radiance_day_dir, cloud_day_dir=cloud_day_dir, satellite=satellite)
     # report per-satellite counts and total files in the directories for clarity
@@ -540,7 +298,8 @@ def process_day(
         tgt_lat2d = None
         target_is_regular = False
 
-    for l1_file in l1_files:
+    # Define single-granule processing function so we can optionally run in parallel
+    def _process_single(l1_file: Path) -> int:
         granule_key = _extract_granule_key(l1_file)
         l2_file = l2_index.get(granule_key)
         LOGGER.debug("L1 %s -> granule %s -> matched L2 %s", l1_file.name, granule_key, l2_file.name if l2_file is not None else None)
@@ -552,25 +311,25 @@ def process_day(
         # If there's no matching L2 cloud-mask file, skip this L1 granule
         if l2_file is None:
             LOGGER.warning("Skipping %s: no matching L2 cloud file", l1_file.name)
-            continue
+            return 0
         try:
             LOGGER.info("Step: loading BT datasets for %s", l1_file.name)
             bt_data = _load_bt_datasets(l1_file=l1_file, channels=channels, reader=l1_reader)
             LOGGER.info("Step: loaded BT datasets for %s: %s", l1_file.name, ",".join(k for k in bt_data.keys() if k.startswith("bt_")))
         except Exception as e:
             LOGGER.exception("Failed to load BT datasets for %s: %s", l1_file.name, e)
-            continue
+            return 0
 
         # build a reference L1 grid from the first BT channel
         reference_key = f"bt_{channels[0]}"
         reference_da = bt_data.get(reference_key)
         if reference_da is None:
             LOGGER.warning("Skipping %s: missing reference BT channel %s", l1_file.name, reference_key)
-            continue
+            return 0
         ref_lon, ref_lat = _area_lonlats(reference_da)
         if ref_lon is None or ref_lat is None:
             LOGGER.warning("Skipping %s: missing geolocation for reference channel %s", l1_file.name, reference_key)
-            continue
+            return 0
 
         if target_is_regular:
             source_lon_extent, source_lat_extent = _coverage_extent_from_points(ref_lon, ref_lat, roi)
@@ -587,7 +346,7 @@ def process_day(
                     source_lon_extent,
                     source_lat_extent,
                 )
-                continue
+                return 0
 
         if not target_is_regular:
             tgt_lon2d = ref_lon
@@ -676,7 +435,7 @@ def process_day(
 
         if not data_vars_final:
             LOGGER.warning("Skipping %s: no variables available after loading/resampling", l1_file.name)
-            continue
+            return 0
 
         # reject very small swaths in regular-grid mode: need at least a 4x4 degree footprint
         if target_is_regular:
@@ -690,7 +449,7 @@ def process_day(
                     valid_mask |= finite
             if valid_mask is None or not np.any(valid_mask):
                 LOGGER.warning("Skipping %s: no valid values after resampling", l1_file.name)
-                continue
+                return 0
             lon_extent, lat_extent = _coverage_extent_regular(valid_mask, regular_lons, regular_lats)
             LOGGER.info("Resampled coverage extent for %s -> lon: %.2f deg, lat: %.2f deg", l1_file.name, lon_extent, lat_extent)
             if lon_extent < 4.0 or lat_extent < 4.0:
@@ -700,7 +459,7 @@ def process_day(
                     lon_extent,
                     lat_extent,
                 )
-                continue
+                return 0
 
         timestamp = _parse_time_from_name(l1_file)
         out_dir = output_base / f"{timestamp.year:04d}" / f"{timestamp.month:02d}" / f"{timestamp.day:02d}"
@@ -710,7 +469,7 @@ def process_day(
         out_file = out_dir / f"{timestamp:%Y%m%dT%H%M}_modis_{out_sat}_{var_tag}.nc"
         if out_file.exists() and not overwrite:
             LOGGER.debug("Skipping existing processed file %s", out_file)
-            continue
+            return 0
 
         coords: Dict[str, Tuple[Tuple[str, ...], np.ndarray] | np.ndarray] = {}
         if target_is_regular:
@@ -775,57 +534,115 @@ def process_day(
             dataset.attrs["grid_type"] = "l1_native"
         dataset.attrs.pop("channels", None)
         dataset.attrs.pop("roi", None)
-        # Robustly sanitize all attributes: convert datetimes and coerce anything
-        # else to strings so NetCDF serialization will not fail.
-        def _safe_attr(val):
-            if isinstance(val, dt.datetime):
-                return val.isoformat()
-            if isinstance(val, (bool, np.bool_)):
-                return int(val)
-            simple_types = (str, bytes, int, float)
-            if isinstance(val, simple_types):
-                return val
-            if isinstance(val, (list, tuple)) and all(isinstance(i, simple_types) for i in val):
-                return val
-            try:
-                # try numpy array -> list
-                if isinstance(val, np.ndarray):
-                    return val.tolist()
-            except Exception:
-                pass
-            # fallback: coerce to string
-            try:
-                return str(val)
-            except Exception:
-                return ""
-
+        # Sanitize attributes using shared helper and prepare NetCDF encodings
         for k in list(dataset.attrs.keys()):
-            dataset.attrs[k] = _safe_attr(dataset.attrs[k])
+            dataset.attrs[k] = safe_attr(dataset.attrs[k])
 
         for name in list(dataset.data_vars) + list(dataset.coords):
             obj = dataset[name]
             for k in list(obj.attrs.keys()):
-                obj.attrs[k] = _safe_attr(obj.attrs[k])
+                obj.attrs[k] = safe_attr(obj.attrs[k])
 
-        # Prepare NetCDF encodings with compression
-        enc: Dict[str, Dict] = {}
-        for name in dataset.data_vars:
-            enc[name] = {"zlib": True, "complevel": 9, "dtype": "float32"}
-        if "cloud_mask" in dataset.data_vars:
-            enc["cloud_mask"] = {"zlib": True, "complevel": 9, "dtype": "float32"}
-        # coords
-        if "latitude" in dataset.coords:
-            enc["latitude"] = {"zlib": True, "complevel": 9, "dtype": "float32"}
-        if "longitude" in dataset.coords:
-            enc["longitude"] = {"zlib": True, "complevel": 9, "dtype": "float32"}
+        enc = prepare_netcdf_encoding(dataset)
+
+        # Convert regular-grid datasets to the requested y/x DataArray layout
+        # with 1D coords named `lat` (y) and `lon` (x) before writing. Ensure
+        # `lat`/`lon` are coordinates (not data variables) and final dataset
+        # dims are (time, y, x).
+        dataset_to_write = dataset
+        if target_is_regular:
+            try:
+                # prefer existing 1D axes if available, otherwise use computed regular arrays
+                lat_coord = dataset.coords.get("latitude")
+                lon_coord = dataset.coords.get("longitude")
+                lat_vals = (
+                    np.asarray(lat_coord.values, dtype=np.float32)
+                    if lat_coord is not None and getattr(lat_coord, "ndim", 1) == 1
+                    else np.asarray(regular_lats, dtype=np.float32)
+                )
+                lon_vals = (
+                    np.asarray(lon_coord.values, dtype=np.float32)
+                    if lon_coord is not None and getattr(lon_coord, "ndim", 1) == 1
+                    else np.asarray(regular_lons, dtype=np.float32)
+                )
+
+                ds_out = xr.Dataset()
+                for name in dataset.data_vars:
+                    var = dataset[name]
+                    vals = np.asarray(var.values)
+                    # collapse leading time singleton if present
+                    if vals.ndim == 3 and vals.shape[0] == 1:
+                        vals2 = vals[0]
+                    elif vals.ndim == 2:
+                        vals2 = vals
+                    else:
+                        vals2 = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+
+                    # ensure shape matches (len(lat), len(lon))
+                    if vals2.shape != (len(lat_vals), len(lon_vals)):
+                        tmp = np.full((len(lat_vals), len(lon_vals)), np.nan, dtype=np.float32)
+                        try:
+                            r0 = min(tmp.shape[0], vals2.shape[0])
+                            c0 = min(tmp.shape[1], vals2.shape[1])
+                            tmp[:r0, :c0] = vals2[:r0, :c0]
+                            vals2 = tmp
+                        except Exception:
+                            vals2 = tmp
+
+                    da = xr.DataArray(
+                        vals2.astype(np.float32),
+                        dims=("y", "x"),
+                        coords={"lat": ("y", lat_vals), "lon": ("x", lon_vals)},
+                        name=name,
+                    )
+                    # copy attributes
+                    for k, v in var.attrs.items():
+                        da.attrs[k] = safe_attr(v)
+                    ds_out[name] = da
+
+                # remove any accidental datavars named 'lat'/'lon' or old 'latitude'/'longitude'
+                for bad in ("lat", "lon", "latitude", "longitude"):
+                    if bad in ds_out.data_vars:
+                        ds_out = ds_out.drop_vars(bad)
+
+                # expand time dimension as the leading axis
+                ds_out = ds_out.expand_dims(time=[np.datetime64(timestamp)])
+
+                # attach 1D coordinate arrays (not variables) and copy global attrs
+                ds_out = ds_out.assign_coords({"lat": ("y", lat_vals), "lon": ("x", lon_vals)})
+                for k, v in dataset.attrs.items():
+                    ds_out.attrs[k] = safe_attr(v)
+
+                dataset_to_write = ds_out
+            except Exception:
+                LOGGER.exception("Failed to convert dataset to requested regular layout; falling back to original dataset")
+
+        enc_out = prepare_netcdf_encoding(dataset_to_write)
 
         if dry_run:
-            LOGGER.info("Dry-run: would write %s (vars: %s)", out_file, ",".join(dataset.data_vars))
+            LOGGER.info("Dry-run: would write %s (vars: %s)", out_file, ",".join(dataset_to_write.data_vars))
             count += 1
         else:
-            dataset.to_netcdf(out_file, encoding=enc)
+            dataset_to_write.to_netcdf(out_file, encoding=enc_out)
             count += 1
             LOGGER.info("Wrote %s", out_file)
+
+    # Execute per-granule processing either in parallel (threads) or serially
+    if parallel and workers and workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        LOGGER.info("Processing %d granules with %d workers", len(l1_files), workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_process_single, f): f for f in l1_files}
+            for fut in as_completed(futures):
+                try:
+                    produced = fut.result()
+                    count += produced
+                except Exception:
+                    LOGGER.exception("Exception in worker while processing %s", futures.get(fut))
+    else:
+        for l1_file in l1_files:
+            count += _process_single(l1_file)
 
     return count
 
@@ -848,6 +665,8 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
     cloud_mask_binary = bool(config.get("processing", {}).get("cloud_mask_binary", True))
     resample_chunk_rows = config.get("processing", {}).get("resample_chunk_rows")
     coord_decimals = config.get("processing", {}).get("coord_decimals")
+    parallel = bool(config.get("processing", {}).get("parallel", False))
+    workers = int(config.get("processing", {}).get("workers", 1))
 
     radiance_base = Path(config["download"]["radiance_base_path"])
     cloud_base = Path(config["download"]["cloud_mask_base_path"])
@@ -875,6 +694,8 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
                 overwrite=overwrite,
                 resample_chunk_rows=resample_chunk_rows,
                 coord_decimals=coord_decimals,
+                parallel=parallel,
+                workers=workers,
             )
             if produced:
                 LOGGER.info("Processed %s files (combined satellites) in %s", produced, radiance_day_dir)
@@ -897,6 +718,8 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
                     overwrite=overwrite,
                     resample_chunk_rows=resample_chunk_rows,
                     coord_decimals=coord_decimals,
+                    parallel=parallel,
+                    workers=workers,
                 )
                 if produced:
                     LOGGER.info("Processed %s files for %s in %s", produced, satellite, radiance_day_dir)

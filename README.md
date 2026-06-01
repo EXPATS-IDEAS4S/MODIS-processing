@@ -36,10 +36,15 @@ Scripts for downloading and processing MODIS Terra/Aqua L1 radiances and L2 clou
   - Each step can be enabled/disabled.
   - Optional cleanup of raw data after processing and/or processed data after upload.
 
-- `scripts/debug_tools.py`
-  - `inspect`: print NetCDF content and variable statistics.
-  - `plot`: generate quicklook PNG maps (BT/cloud mask).
-  - `verify-s3`: check local NetCDF objects exist in the bucket.
+- `scripts/debug/`
+  - `inspect_nc.py`: print NetCDF content and variable statistics.
+  - `plot_nc.py`: generate quicklook PNGs for a single file.
+  - `plot_nc_day.py`: generate quicklooks for all processed NetCDF files in a day folder.
+  - `plot_hdf_day.py`: generate quicklooks for raw L1/L2 granules for a day.
+  - `verify_s3.py`: check local NetCDF objects exist in the bucket.
+  - `run_debug.py`: launch one or more debug tasks sequentially or in parallel.
+
+The legacy `scripts/debug_tools.py` entry point is still present for backward compatibility, but the new scripts above are the preferred interface.
 
 ## Configuration
 
@@ -57,9 +62,10 @@ Example includes:
 - years: `[2024]`
 - months: `[4, 5, 6, 7, 8, 9]`
 
-New processing keys (added):
 - `processing.resample`: true|false — whether to resample to a regular lat/lon grid (default: true)
 - `processing.target_resolution_deg`: grid spacing in degrees when resampling (default: 0.01)
+- `processing.resample_chunk_rows`: integer or null — when set, resampling will be performed in row-chunks of this many rows to reduce peak memory usage during griddata regridding. Default: null (disabled).
+- `processing.coord_decimals`: integer or null — number of decimal places to round output 1D `latitude`/`longitude` axes so the grid is exactly regular. If null the pipeline derives a sensible value from `target_resolution_deg`.
 
 3. Set Earthdata token:
 
@@ -125,19 +131,25 @@ This runs yearly cycles using the `pipeline` toggles in config:
 Inspect file content and stats:
 
 ```bash
-python scripts/debug_tools.py inspect --file /path/to/file.nc
+python scripts/debug/inspect_nc.py --file /path/to/file.nc
 ```
 
 Generate quicklook plots:
 
 ```bash
-python scripts/debug_tools.py plot --file /path/to/file.nc --output-dir /path/to/plots
+python scripts/debug/plot_nc.py --file /path/to/file.nc --output-dir /path/to/plots
+```
+
+Run a group of debug tasks together:
+
+```bash
+python scripts/debug/run_debug.py --group file --file /path/to/file.nc --output-dir /path/to/plots --parallel
 ```
 
 Verify local NetCDF files are in bucket:
 
 ```bash
-python scripts/debug_tools.py verify-s3 --local-base /data/modis/processed --credentials s3_credentials.py --bucket-prefix modis/processed
+python scripts/debug/verify_s3.py --local-base /data/modis/processed --credentials s3_credentials.py --bucket-prefix modis/processed
 ```
 
 ## Notes
@@ -151,5 +163,9 @@ python scripts/debug_tools.py verify-s3 --local-base /data/modis/processed --cre
 Additional notes on processing behavior and dependencies:
 - The processor prefers to use the native geolocation (latitude/longitude) returned by Satpy for each granule. If L1 geolocation is missing for a granule it will currently be skipped and a warning logged; we can enable fallback to L2 geolocation if desired.
 - Regridding is implemented using `scipy.interpolate.griddata` as a generic fallback for 2D geolocation. For best performance on swath-to-grid resampling, installing `pyresample` is recommended — the code will attempt to use pyresample where available in the future.
+  - When processing large granules the resampling step can be memory intensive. The pipeline supports two mitigations:
+    - Chunked regridding: set `processing.resample_chunk_rows` to an integer to process the target grid in row-blocks and reduce peak memory usage.
+    - Deterministic coordinates: set `processing.coord_decimals` to force rounding of output 1D coordinates so tools treating the grid as regular do not fail on tiny floating differences.
+  For distributed/very large workloads, a `dask`-enabled xarray backend or `pyresample` are recommended for better performance and lower memory pressure.
 - The Satpy readers require HDF4 support (`pyhdf`) in the Python environment. Ensure your `satpy` conda env includes `pyhdf` (and `scipy` for resampling).
 - NetCDF files are written with compression level 9 to reduce disk and upload bandwidth.

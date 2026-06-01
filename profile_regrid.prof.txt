@@ -1,0 +1,40 @@
+Fri May 29 16:59:59 2026    profile_regrid.prof
+
+         144238 function calls (139004 primitive calls) in 14.199 seconds
+
+   Ordered by: cumulative time
+   List reduced from 1315 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+    310/1    0.003    0.000   14.199   14.199 {built-in method builtins.exec}
+        1    0.003    0.003   14.199   14.199 /home/Daniele/codes/MODIS-processing/scripts/utils/regrid.py:9(_regrid_to_target)
+    367/1    0.002    0.000    8.722    8.722 <frozen importlib._bootstrap>:1022(_find_and_load)
+    364/1    0.002    0.000    8.722    8.722 <frozen importlib._bootstrap>:987(_find_and_load_unlocked)
+    349/2    0.002    0.000    8.702    4.351 <frozen importlib._bootstrap>:664(_load_unlocked)
+    279/2    0.001    0.000    8.702    4.351 <frozen importlib._bootstrap_external>:877(exec_module)
+    535/2    0.000    0.000    8.642    4.321 <frozen importlib._bootstrap>:233(_call_with_frames_removed)
+   128/23    0.000    0.000    8.040    0.350 {built-in method builtins.__import__}
+        1    0.000    0.000    7.982    7.982 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/interpolate/__init__.py:1(<module>)
+        1    0.000    0.000    7.604    7.604 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/interpolate/_interpolate.py:1(<module>)
+   297/40    0.001    0.000    7.400    0.185 <frozen importlib._bootstrap>:1053(_handle_fromlist)
+        1    5.455    5.455    5.468    5.468 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/interpolate/_ndgriddata.py:174(griddata)
+      349    0.001    0.000    5.318    0.015 <frozen importlib._bootstrap>:564(module_from_spec)
+       69    0.000    0.000    5.308    0.077 <frozen importlib._bootstrap_external>:1174(create_module)
+       69    5.307    0.077    5.307    0.077 {built-in method _imp.create_dynamic}
+        1    0.000    0.000    4.216    4.216 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/special/__init__.py:1(<module>)
+2496/1732    0.001    0.000    4.090    0.002 {built-in method builtins.hasattr}
+      5/3    0.000    0.000    4.090    1.363 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/__init__.py:132(__getattr__)
+      5/3    0.000    0.000    4.090    1.363 /home/Daniele/miniforge3/envs/icon/lib/python3.10/importlib/__init__.py:108(import_module)
+      5/3    0.000    0.000    4.090    1.363 <frozen importlib._bootstrap>:1038(_gcd_import)
+        1    0.000    0.000    3.153    3.153 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/special/_orthogonal.py:1(<module>)
+        1    0.000    0.000    3.129    3.129 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/interpolate/_fitpack_py.py:1(<module>)
+        1    0.000    0.000    3.101    3.101 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/linalg/__init__.py:1(<module>)
+        1    0.000    0.000    2.996    2.996 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/interpolate/_bsplines.py:1(<module>)
+        1    0.000    0.000    2.909    2.909 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/optimize/__init__.py:1(<module>)
+      279    0.003    0.000    2.626    0.009 <frozen importlib._bootstrap_external>:950(get_code)
+      279    0.001    0.000    2.594    0.009 <frozen importlib._bootstrap_external>:1070(get_data)
+        1    0.000    0.000    2.162    2.162 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/linalg/_sketches.py:1(<module>)
+        1    0.000    0.000    2.115    2.115 /home/Daniele/miniforge3/envs/icon/lib/python3.10/site-packages/scipy/sparse/__init__.py:1(<module>)
+      279    2.018    0.007    2.018    0.007 {method 'read' of '_io.BufferedReader' objects}
+
+

@@ -24,12 +24,13 @@ paths, date, channel selection, and output directory.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 from typing import List, Optional
 import yaml
 
-#import boto3
+import boto3
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
@@ -40,7 +41,30 @@ import matplotlib.pyplot as mpl
 import cartopy.feature as cfeature
 from matplotlib.colors import BoundaryNorm, ListedColormap
 
-#from upload_s3 import load_s3_credentials
+
+
+def _load_s3_credentials(credentials_path: Path) -> dict:
+    credentials_path = credentials_path.resolve()
+    if not credentials_path.exists():
+        raise RuntimeError(f"Credentials file not found: {credentials_path}")
+
+    spec = importlib.util.spec_from_file_location("s3_credentials_local", credentials_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load credentials from {credentials_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    required = ["S3_BUCKET_NAME", "S3_ACCESS_KEY", "S3_SECRET_ACCESS_KEY", "S3_ENDPOINT_URL"]
+    missing = [item for item in required if not hasattr(module, item)]
+    if missing:
+        raise RuntimeError(f"Missing credentials in {credentials_path}: {missing}")
+
+    return {
+        "bucket": module.S3_BUCKET_NAME,
+        "access_key": module.S3_ACCESS_KEY,
+        "secret_key": module.S3_SECRET_ACCESS_KEY,
+        "endpoint": module.S3_ENDPOINT_URL,
+    }
 
 
 def inspect_file(path: Path) -> None:
@@ -155,17 +179,39 @@ def plot_file(path: Path, output_dir: Path) -> None:
 
 
 def _nc_geolocation_for_var(ds: xr.Dataset, data: xr.DataArray) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    if "longitude" in data.coords and "latitude" in data.coords:
-        lon = np.asarray(data.coords["longitude"].values)
-        lat = np.asarray(data.coords["latitude"].values)
+    lon_name = None
+    lat_name = None
+    for candidate in ("longitude", "lon"):
+        if candidate in data.coords:
+            lon_name = candidate
+            break
+    for candidate in ("latitude", "lat"):
+        if candidate in data.coords:
+            lat_name = candidate
+            break
+
+    if lon_name is not None and lat_name is not None:
+        lon = np.asarray(data.coords[lon_name].values)
+        lat = np.asarray(data.coords[lat_name].values)
         if lon.ndim == 1 and lat.ndim == 1:
             lon2d, lat2d = np.meshgrid(lon, lat)
             return lon2d, lat2d
         return lon, lat
 
-    if "longitude" in ds.coords and "latitude" in ds.coords:
-        lon = np.asarray(ds.coords["longitude"].values)
-        lat = np.asarray(ds.coords["latitude"].values)
+    lon_name = None
+    lat_name = None
+    for candidate in ("longitude", "lon"):
+        if candidate in ds.coords:
+            lon_name = candidate
+            break
+    for candidate in ("latitude", "lat"):
+        if candidate in ds.coords:
+            lat_name = candidate
+            break
+
+    if lon_name is not None and lat_name is not None:
+        lon = np.asarray(ds.coords[lon_name].values)
+        lat = np.asarray(ds.coords[lat_name].values)
         if lon.ndim == 1 and lat.ndim == 1:
             lon2d, lat2d = np.meshgrid(lon, lat)
             return lon2d, lat2d
@@ -536,7 +582,7 @@ def plot_hdf_day(
 
 
 def verify_s3_uploads(base_path: Path, credentials_path: Path, bucket_prefix: str = "") -> None:
-    creds = load_s3_credentials(credentials_path)
+    creds = _load_s3_credentials(credentials_path)
     s3 = boto3.client(
         "s3",
         endpoint_url=creds["endpoint"],
