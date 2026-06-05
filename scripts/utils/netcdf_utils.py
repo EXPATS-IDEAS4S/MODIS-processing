@@ -30,15 +30,18 @@ def safe_attr(val):
         return ""
 
 
-def prepare_netcdf_encoding(dataset: xr.Dataset) -> Dict[str, Dict]:
+def prepare_netcdf_encoding(dataset: xr.Dataset, compression_level: int = 4) -> Dict[str, Dict]:
+    compression_level = int(compression_level)
+    if compression_level < 0 or compression_level > 9:
+        raise ValueError("compression_level must be between 0 and 9")
+
     enc = {}
     for name in dataset.data_vars:
-        enc[name] = {"zlib": True, "complevel": 9, "dtype": "float32"}
+        enc[name] = {"zlib": True, "complevel": compression_level, "dtype": "float32"}
     if "cloud_mask" in dataset.data_vars:
-        enc["cloud_mask"] = {"zlib": True, "complevel": 9, "dtype": "float32"}
+        enc["cloud_mask"] = {"zlib": True, "complevel": compression_level, "dtype": "float32"}
     # coords
-    if "latitude" in dataset.coords:
-        enc["latitude"] = {"zlib": True, "complevel": 9, "dtype": "float32"}
-    if "longitude" in dataset.coords:
-        enc["longitude"] = {"zlib": True, "complevel": 9, "dtype": "float32"}
+    for coord_name in ("latitude", "longitude", "lat", "lon"):
+        if coord_name in dataset.coords:
+            enc[coord_name] = {"zlib": True, "complevel": compression_level, "dtype": "float32"}
     return enc

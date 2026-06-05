@@ -17,7 +17,7 @@ How to run
     `years`, `months`.
 - Run from the repository root:
 
-        python scripts/process_modis.py --config config/pipeline_config.yaml
+    python scripts/1_process_modis.py --config config/pipeline_config.yaml
 
 - Useful flags:
     - `--dry-run`: run without writing output (processes only the first day)
@@ -28,8 +28,10 @@ Config notes
 The script reads processing options from the `processing` section of the
 config, e.g. `target_resolution_deg`, `resample` (True/False),
 `combine_satellites`, `l1_reader`, `l2_reader`, `cloud_mask_channel`,
-`cloud_mask_binary`, `overwrite`, and `verbose`. See
-`config/pipeline_config.example.yaml` for defaults and examples.
+`cloud_mask_binary`, `overwrite`, and `verbose`. Day selection comes from
+`years`, `months`, and optional `days` in the YAML config, or from a single
+`--date YYYY-MM-DD` override. See `config/pipeline_config.example.yaml` for
+defaults and examples.
 
 Output
 ------
@@ -79,6 +81,8 @@ from scripts.utils.io import (
 )
 
 from scripts.utils.regrid import (
+    build_regrid_cache,
+    _same_grid,
     _regrid_to_target,
     _resample_with_outside_nan,
     _coverage_extent_from_points,
@@ -259,6 +263,7 @@ def process_day(
     overwrite: bool = False,
     resample_chunk_rows: Optional[int] = None,
     coord_decimals: Optional[int] = None,
+    compression_level: int = 4,
     parallel: bool = False,
     workers: int = 1,
 ) -> int:
@@ -300,6 +305,7 @@ def process_day(
 
     # Define single-granule processing function so we can optionally run in parallel
     def _process_single(l1_file: Path) -> int:
+        produced = 0
         granule_key = _extract_granule_key(l1_file)
         l2_file = l2_index.get(granule_key)
         LOGGER.debug("L1 %s -> granule %s -> matched L2 %s", l1_file.name, granule_key, l2_file.name if l2_file is not None else None)
@@ -330,6 +336,10 @@ def process_day(
         if ref_lon is None or ref_lat is None:
             LOGGER.warning("Skipping %s: missing geolocation for reference channel %s", l1_file.name, reference_key)
             return 0
+        
+        nan_lon = np.isnan(ref_lon).sum()
+        nan_lat = np.isnan(ref_lat).sum()
+
 
         if target_is_regular:
             source_lon_extent, source_lat_extent = _coverage_extent_from_points(ref_lon, ref_lat, roi)
@@ -348,9 +358,35 @@ def process_day(
                 )
                 return 0
 
+        # use local copies of the target grid inside the per-granule function
+        # to avoid creating inner-scope assignments that shadow outer variables
+        local_tgt_lon2d = tgt_lon2d
+        local_tgt_lat2d = tgt_lat2d
         if not target_is_regular:
-            tgt_lon2d = ref_lon
-            tgt_lat2d = ref_lat
+            local_tgt_lon2d = ref_lon
+            local_tgt_lat2d = ref_lat
+
+        bt_cache = None
+        native_cache = None
+
+        if target_is_regular:
+
+            if nan_lon or nan_lat:
+                LOGGER.warning(
+                    "Skipping %s: geolocation contains NaNs "
+                    "(lon=%s lat=%s)",
+                    l1_file.name,
+                    nan_lon,
+                    nan_lat,
+                )
+                return 0
+
+            bt_cache = build_regrid_cache(
+                ref_lon,
+                ref_lat,
+                local_tgt_lon2d,
+                local_tgt_lat2d,
+            )
 
         # resample or preserve each BT channel against the target grid
         data_vars_final: Dict[str, xr.DataArray] = {}
@@ -367,23 +403,73 @@ def process_day(
             if target_is_regular:
                 LOGGER.info("Step: resampling BT %s to regular grid for %s", channel, l1_file.name)
                 try:
-                    re_da = _regrid_to_target(src_da.astype(np.float32), src_lon, src_lat, tgt_lon2d, tgt_lat2d, method="linear", chunk_rows=resample_chunk_rows)
+                    cache = bt_cache if bt_cache is not None and _same_grid(src_lon, src_lat, ref_lon, ref_lat) else None
+                    re_da = _regrid_to_target(
+                        src_da.astype(np.float32),
+                        src_lon,
+                        src_lat,
+                        local_tgt_lon2d,
+                        local_tgt_lat2d,
+                        method="linear",
+                        chunk_rows=resample_chunk_rows,
+                        cache=cache,
+                    )
                     data_vars_final[key] = re_da.rename({"y": "latitude", "x": "longitude"}).reset_coords(drop=True).rename(key).astype(np.float32)
                     LOGGER.debug("Resampled %s -> shape %s", key, data_vars_final[key].shape)
                 except Exception:
-                    LOGGER.warning("Failed regridding BT %s for %s", channel, l1_file.name)
+                    LOGGER.exception("Failed regridding BT %s for %s", channel, l1_file.name)
             else:
                 if src_da.shape == ref_lat.shape and src_da.shape == ref_lon.shape:
-                    LOGGER.info("Step: keeping native L1 grid for %s", channel)
-                    data_vars_final[key] = src_da.astype(np.float32).rename(key)
+                    LOGGER.info(
+                        "Step: keeping native L1 grid for %s",
+                        channel,
+                    )
+
+                    data_vars_final[key] = (
+                        src_da.astype(np.float32)
+                        .rename(key)
+                    )
+
                 else:
-                    LOGGER.info("Step: regridding BT %s onto L1 grid for %s", channel, l1_file.name)
+                    LOGGER.info(
+                        "Step: regridding BT %s onto L1 grid for %s",
+                        channel,
+                        l1_file.name,
+                    )
+
+                    if native_cache is None:
+
+                        if nan_lon or nan_lat:
+                            LOGGER.warning(
+                                "Cannot build native regrid cache for %s "
+                                "because geolocation contains NaNs",
+                                l1_file.name,
+                            )
+                            return 0
+
+   
+                        native_cache = build_regrid_cache(
+                            ref_lon,
+                            ref_lat,
+                            local_tgt_lon2d,
+                            local_tgt_lat2d,
+                        )
+
                     try:
-                        re_da = _regrid_to_target(src_da.astype(np.float32), src_lon, src_lat, tgt_lon2d, tgt_lat2d, method="linear", chunk_rows=resample_chunk_rows)
+                        re_da = _regrid_to_target(
+                            src_da.astype(np.float32),
+                            src_lon,
+                            src_lat,
+                            local_tgt_lon2d,
+                            local_tgt_lat2d,
+                            method="linear",
+                            chunk_rows=resample_chunk_rows,
+                            cache=native_cache,
+                        )
                         data_vars_final[key] = re_da.rename(key).astype(np.float32)
                         LOGGER.debug("Regridded %s -> shape %s", key, data_vars_final[key].shape)
                     except Exception:
-                        LOGGER.warning("Failed regridding BT %s for %s onto L1 grid", channel, l1_file.name)
+                        LOGGER.exception("Failed regridding BT %s for %s onto L1 grid", channel, l1_file.name)
 
         # cloud mask: load L2 and place it on the same target grid
         cloud_da = None
@@ -399,36 +485,40 @@ def process_day(
                 LOGGER.info("Step: loading/resampling cloud mask from %s", l2_file.name)
                 if target_is_regular:
                     try:
+                        cloud_cache = bt_cache if bt_cache is not None and _same_grid(cloud_lon, cloud_lat, ref_lon, ref_lat) else None
                         cloud_da = _resample_with_outside_nan(
                             cloud_src.astype(np.float32),
                             cloud_lon,
                             cloud_lat,
-                            tgt_lon2d,
-                            tgt_lat2d,
+                            local_tgt_lon2d,
+                            local_tgt_lat2d,
                             method="nearest",
                             chunk_rows=resample_chunk_rows,
+                            cache=cloud_cache,
                         ).rename({"y": "latitude", "x": "longitude"}).reset_coords(drop=True).rename("cloud_mask").astype(np.float32)
                         LOGGER.debug("Cloud mask resampled -> shape %s", cloud_da.shape)
                     except Exception:
-                        LOGGER.warning("Failed regridding cloud mask for %s", l2_file.name)
+                        LOGGER.exception("Failed regridding cloud mask for %s", l2_file.name)
                 else:
                     if cloud_src.shape == ref_lat.shape and cloud_src.shape == ref_lon.shape:
                         LOGGER.info("Step: keeping native L1 grid for cloud mask")
                         cloud_da = cloud_src.astype(np.float32).rename("cloud_mask")
                     else:
                         try:
+                            cloud_cache = native_cache if native_cache is not None and _same_grid(cloud_lon, cloud_lat, ref_lon, ref_lat) else None
                             cloud_da = _resample_with_outside_nan(
-                                        cloud_src.astype(np.float32),
-                                        cloud_lon,
-                                        cloud_lat,
-                                        tgt_lon2d,
-                                        tgt_lat2d,
-                                        method="nearest",
-                                        chunk_rows=resample_chunk_rows,
-                                    ).rename("cloud_mask").astype(np.float32)
+                                cloud_src.astype(np.float32),
+                                cloud_lon,
+                                cloud_lat,
+                                local_tgt_lon2d,
+                                local_tgt_lat2d,
+                                method="nearest",
+                                chunk_rows=resample_chunk_rows,
+                                cache=cloud_cache,
+                            ).rename("cloud_mask").astype(np.float32)
                             LOGGER.debug("Cloud mask regridded onto L1 grid -> shape %s", cloud_da.shape)
                         except Exception:
-                            LOGGER.warning("Failed regridding cloud mask for %s onto L1 grid", l2_file.name)
+                            LOGGER.exception("Failed regridding cloud mask for %s onto L1 grid", l2_file.name)
 
         if cloud_da is not None:
             data_vars_final["cloud_mask"] = cloud_da
@@ -480,8 +570,8 @@ def process_day(
                 for name, da in data_vars_final.items()
             }
         else:
-            coords["latitude"] = (("y", "x"), np.asarray(tgt_lat2d, dtype=np.float32))
-            coords["longitude"] = (("y", "x"), np.asarray(tgt_lon2d, dtype=np.float32))
+            coords["latitude"] = (("y", "x"), np.asarray(local_tgt_lat2d, dtype=np.float32))
+            coords["longitude"] = (("y", "x"), np.asarray(local_tgt_lon2d, dtype=np.float32))
 
         dataset = xr.Dataset(data_vars=data_vars_final, coords=coords).expand_dims(time=[np.datetime64(timestamp)])
         if target_is_regular:
@@ -541,9 +631,11 @@ def process_day(
         for name in list(dataset.data_vars) + list(dataset.coords):
             obj = dataset[name]
             for k in list(obj.attrs.keys()):
-                obj.attrs[k] = safe_attr(obj.attrs[k])
-
-        enc = prepare_netcdf_encoding(dataset)
+                val = obj.attrs[k]
+                if k == "coordinates" and isinstance(val, (list, tuple)):
+                    obj.attrs[k] = " ".join(str(item) for item in val)
+                else:
+                    obj.attrs[k] = safe_attr(val)
 
         # Convert regular-grid datasets to the requested y/x DataArray layout
         # with 1D coords named `lat` (y) and `lon` (x) before writing. Ensure
@@ -597,7 +689,10 @@ def process_day(
                     )
                     # copy attributes
                     for k, v in var.attrs.items():
-                        da.attrs[k] = safe_attr(v)
+                        if k == "coordinates" and isinstance(v, (list, tuple)):
+                            da.attrs[k] = " ".join(str(item) for item in v)
+                        else:
+                            da.attrs[k] = safe_attr(v)
                     ds_out[name] = da
 
                 # remove any accidental datavars named 'lat'/'lon' or old 'latitude'/'longitude'
@@ -617,15 +712,92 @@ def process_day(
             except Exception:
                 LOGGER.exception("Failed to convert dataset to requested regular layout; falling back to original dataset")
 
-        enc_out = prepare_netcdf_encoding(dataset_to_write)
+        if not target_is_regular:
+            try:
+                dataset_to_write = dataset_to_write.rename({"latitude": "lat", "longitude": "lon"})
+            except Exception:
+                pass
+
+            # Keep native-grid outputs readable by stripping Satpy-specific
+            # metadata and retaining only a small, useful attribute set.
+            for name in list(dataset_to_write.variables):
+                obj = dataset_to_write[name]
+                source_attrs = dict(obj.attrs)
+                cleaned_attrs: Dict[str, object] = {}
+                if name in {"lat", "lon"}:
+                    for key in ("standard_name", "units", "long_name"):
+                        if key in source_attrs:
+                            cleaned_attrs[key] = safe_attr(source_attrs[key])
+                elif name == "cloud_mask":
+                    cleaned_attrs["long_name"] = "Binary MODIS cloud mask" if cloud_mask_binary else safe_attr(source_attrs.get("long_name", "MODIS cloud mask"))
+                    cleaned_attrs["units"] = "1" if cloud_mask_binary else safe_attr(source_attrs.get("units", "none"))
+                    cleaned_attrs["coordinates"] = "lat lon"
+                    if cloud_mask_binary:
+                        cleaned_attrs["flag_values"] = [0, 1]
+                        cleaned_attrs["flag_meanings"] = "clear cloudy"
+                elif name.startswith("bt_"):
+                    for key in ("long_name", "units", "standard_name"):
+                        if key in source_attrs:
+                            cleaned_attrs[key] = safe_attr(source_attrs[key])
+                    cleaned_attrs["coordinates"] = "lat lon"
+                elif name not in {"time"}:
+                    for key in ("long_name", "units", "standard_name", "coordinates"):
+                        if key in source_attrs:
+                            cleaned_attrs[key] = safe_attr(source_attrs[key])
+
+                obj.attrs.clear()
+                obj.attrs.update(cleaned_attrs)
+
+            dataset_to_write.attrs.pop("crs", None)
+            dataset_to_write.attrs["grid_type"] = "l1_native"
+
+        # NetCDF backends can't serialize arbitrary Python objects (for example
+        # a CRS object stored in a scalar variable). Preserve a string version
+        # in attrs and drop object-typed variables before writing.
+        object_vars: list[str] = []
+        for name in list(dataset_to_write.variables):
+            try:
+                if dataset_to_write[name].dtype != object:
+                    continue
+            except Exception:
+                continue
+
+            object_vars.append(name)
+            value_str = ""
+            try:
+                scalar = dataset_to_write[name].values.item()
+                if hasattr(scalar, "to_wkt"):
+                    value_str = str(scalar.to_wkt())
+                elif hasattr(scalar, "to_string"):
+                    value_str = str(scalar.to_string())
+                else:
+                    value_str = str(scalar)
+            except Exception:
+                try:
+                    value_str = str(dataset_to_write[name].values)
+                except Exception:
+                    value_str = ""
+
+            if name == "crs":
+                dataset_to_write.attrs["crs"] = safe_attr(value_str)
+            else:
+                dataset_to_write.attrs[f"{name}_value"] = safe_attr(value_str)
+
+        drop_vars = [name for name in object_vars if name in dataset_to_write.data_vars or name in dataset_to_write.coords]
+        if drop_vars:
+            dataset_to_write = dataset_to_write.drop_vars(drop_vars)
+
+        enc_out = prepare_netcdf_encoding(dataset_to_write, compression_level=compression_level)
 
         if dry_run:
             LOGGER.info("Dry-run: would write %s (vars: %s)", out_file, ",".join(dataset_to_write.data_vars))
-            count += 1
+            produced += 1
         else:
             dataset_to_write.to_netcdf(out_file, encoding=enc_out)
-            count += 1
+            produced += 1
             LOGGER.info("Wrote %s", out_file)
+
+        return produced
 
     # Execute per-granule processing either in parallel (threads) or serially
     if parallel and workers and workers > 1:
@@ -647,14 +819,15 @@ def process_day(
     return count
 
 
-def run_processing(config: Dict, dry_run: bool = False) -> None:
+def run_processing(config: Dict, dry_run: bool = False, date: dt.date | None = None) -> None:
     channels = config["channels"]
     for channel in channels:
         if channel not in CHANNEL_TO_BAND:
             raise ValueError(f"Unsupported channel '{channel}'. Supported: {sorted(CHANNEL_TO_BAND)}")
 
-    years = config["years"]
-    months = config["months"]
+    years = [date.year] if date is not None else config["years"]
+    months = [date.month] if date is not None else config["months"]
+    days = [date.day] if date is not None else config.get("days", "all")
     overwrite = bool(config.get("overwrite", False))
     roi = config.get("roi", {})
     resolution_deg = float(config.get("processing", {}).get("target_resolution_deg", 0.01))
@@ -665,6 +838,7 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
     cloud_mask_binary = bool(config.get("processing", {}).get("cloud_mask_binary", True))
     resample_chunk_rows = config.get("processing", {}).get("resample_chunk_rows")
     coord_decimals = config.get("processing", {}).get("coord_decimals")
+    compression_level = int(config.get("processing", {}).get("compression_level", 4))
     parallel = bool(config.get("processing", {}).get("parallel", False))
     workers = int(config.get("processing", {}).get("workers", 1))
 
@@ -673,7 +847,7 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
     output_base = Path(config["processing"]["output_base_path"])
     combine_satellites = bool(config.get("processing", {}).get("combine_satellites", False))
 
-    for radiance_day_dir in iter_days(base_path=radiance_base, years=years, months=months):
+    for radiance_day_dir in iter_days(base_path=radiance_base, years=years, months=months, days=days):
         rel_day = radiance_day_dir.relative_to(radiance_base)
         cloud_day_dir = cloud_base / rel_day
         if combine_satellites:
@@ -694,6 +868,7 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
                 overwrite=overwrite,
                 resample_chunk_rows=resample_chunk_rows,
                 coord_decimals=coord_decimals,
+                compression_level=compression_level,
                 parallel=parallel,
                 workers=workers,
             )
@@ -718,6 +893,7 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
                     overwrite=overwrite,
                     resample_chunk_rows=resample_chunk_rows,
                     coord_decimals=coord_decimals,
+                    compression_level=compression_level,
                     parallel=parallel,
                     workers=workers,
                 )
@@ -731,6 +907,7 @@ def run_processing(config: Dict, dry_run: bool = False) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Process MODIS L1/L2 files to BT+cloud mask NetCDF")
     parser.add_argument("--config", required=True, help="Path to YAML pipeline config")
+    parser.add_argument("--date", default=None, help="Process only one day in YYYY-MM-DD format")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--dry-run", action="store_true", help="Process only the first available day and exit")
     return parser.parse_args()
@@ -756,7 +933,8 @@ def main() -> None:
     if bool(getattr(args, "dry_run", False)):
         LOGGER.info("Running in dry-run mode")
 
-    run_processing(config=config, dry_run=bool(getattr(args, "dry_run", False)))
+    selected_date = dt.date.fromisoformat(args.date) if args.date else None
+    run_processing(config=config, dry_run=bool(getattr(args, "dry_run", False)), date=selected_date)
 
 
 if __name__ == "__main__":

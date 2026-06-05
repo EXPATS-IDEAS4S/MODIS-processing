@@ -580,6 +580,28 @@ def plot_hdf_day(
         mpl.close(fig)
         print(f"Saved {out_file}")
 
+def check_s3_uploads(credentials_path: Path, bucket_prefix: str = "") -> None:
+    creds = _load_s3_credentials(credentials_path)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=creds["endpoint"],
+        aws_access_key_id=creds["access_key"],
+        aws_secret_access_key=creds["secret_key"],
+    )
+
+    #list all content
+    all_files = []
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=creds["bucket"], Prefix=bucket_prefix):
+        for obj in page.get('Contents', []):
+            all_files.append(obj['Key'])
+    
+    print("Sample S3 keys:")
+    for key in sorted(all_files)[:10]:
+        print(f"  {key}")
+
+    print(f"Found {len(all_files)} objects in S3 bucket '{creds['bucket']}' with prefix '{bucket_prefix}'")
+
 
 def verify_s3_uploads(base_path: Path, credentials_path: Path, bucket_prefix: str = "") -> None:
     creds = _load_s3_credentials(credentials_path)
@@ -592,6 +614,8 @@ def verify_s3_uploads(base_path: Path, credentials_path: Path, bucket_prefix: st
 
     missing = []
     prefix = bucket_prefix.strip("/")
+    print(f"Checking S3 bucket '{creds['bucket']}' for files under prefix '{prefix}' corresponding to local files in {base_path}...")
+    print(sorted(base_path.rglob("*.nc")))
     for file_path in sorted(base_path.rglob("*.nc")):
         rel = file_path.relative_to(base_path).as_posix()
         key = f"{prefix}/{rel}" if prefix else rel

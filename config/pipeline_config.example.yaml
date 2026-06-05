@@ -5,7 +5,9 @@ auth:
 
 # Period selection
 years: [2024]
-months: [4]#, 5, 6, 7, 8, 9]
+months: [4]
+# Set to `all` to use every day in the selected months, or provide an explicit list like [1, 5, 15, 28]
+days: all
 
 # ROI (Europe)
 roi:
@@ -25,9 +27,18 @@ download:
   radiance_base_path: /sat_data/modis/raw/radiances
   # Cloud mask files are stored in a separate base path with the same day folder structure.
   cloud_mask_base_path: /sat_data/modis/raw/cloud_mask
+  # Set true to download matching granules concurrently.
+  parallel: false
+  # Number of worker threads used when parallel download is enabled.
+  workers: 4
+  # Skip granules whose reported footprint overlaps the ROI by less than this fraction.
+  # Set to 0.0 to keep every CMR match that intersects the search box.
+  min_overlap_fraction: 0.0
 
 processing:
   output_base_path: /sat_data/modis/processed
+  # NetCDF compression level from 0 (off) to 9 (max). Lower is faster.
+  compression_level: 4
 
 upload:
   # Optional prefix in the destination bucket

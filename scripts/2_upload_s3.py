@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Upload MODIS processed files to an S3-compatible object store."""
+"""Upload MODIS processed files to an S3-compatible object store.
+
+The upload window can come from the YAML config (`years`, `months`, and
+optional `days`) or from a single `--date YYYY-MM-DD` override.
+"""
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import importlib.util
 import logging
 from pathlib import Path
@@ -12,6 +17,8 @@ from typing import Dict, Iterable
 import boto3
 import yaml
 from botocore.exceptions import ClientError
+
+from scripts.utils.io import iter_days
 
 LOGGER = logging.getLogger("upload_s3")
 
@@ -44,15 +51,11 @@ def load_s3_credentials(credentials_path: Path) -> Dict[str, str]:
     }
 
 
-def iter_files(base_path: Path, years: Iterable[int], months: Iterable[int], pattern: str = "*.nc") -> Iterable[Path]:
-    for year in years:
-        for month in months:
-            root = base_path / f"{year:04d}" / f"{month:02d}"
-            if not root.exists():
-                continue
-            for file_path in sorted(root.rglob(pattern)):
-                if file_path.is_file():
-                    yield file_path
+def iter_files(base_path: Path, years: Iterable[int], months: Iterable[int], days: Iterable[int] | str | None = None, pattern: str = "*.nc") -> Iterable[Path]:
+    for day_dir in iter_days(base_path=base_path, years=years, months=months, days=days):
+        for file_path in sorted(day_dir.rglob(pattern)):
+            if file_path.is_file():
+                yield file_path
 
 
 def upload_file(s3_client, file_path: Path, bucket: str, object_key: str) -> bool:
@@ -73,7 +76,7 @@ def verify_uploaded(s3_client, bucket: str, key: str) -> bool:
         return False
 
 
-def run_upload(config: Dict, credentials_path: Path, verify: bool = False, dry_run: bool = False) -> None:
+def run_upload(config: Dict, credentials_path: Path, verify: bool = False, dry_run: bool = False, date: dt.date | None = None) -> None:
     creds = load_s3_credentials(credentials_path)
     s3_client = boto3.client(
         "s3",
@@ -84,11 +87,12 @@ def run_upload(config: Dict, credentials_path: Path, verify: bool = False, dry_r
 
     local_base = Path(config["processing"]["output_base_path"])
     bucket_prefix = config["upload"].get("bucket_prefix", "").strip("/")
-    years = config["years"]
-    months = config["months"]
+    years = [date.year] if date is not None else config["years"]
+    months = [date.month] if date is not None else config["months"]
+    days = [date.day] if date is not None else config.get("days", "all")
 
     uploaded = 0
-    for file_path in iter_files(base_path=local_base, years=years, months=months):
+    for file_path in iter_files(base_path=local_base, years=years, months=months, days=days):
         rel_path = file_path.relative_to(local_base).as_posix()
         key = f"{bucket_prefix}/{rel_path}" if bucket_prefix else rel_path
 
@@ -112,6 +116,7 @@ def parse_args() -> argparse.Namespace:
         default="s3_credentials.py",
         help="Path to local python credentials file (excluded from git)",
     )
+    parser.add_argument("--date", default=None, help="Upload only one day in YYYY-MM-DD format")
     parser.add_argument("--verify", action="store_true", help="Verify each uploaded object with head_object")
     parser.add_argument("--dry-run", action="store_true", help="List files that would be uploaded")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -125,7 +130,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     config = load_config(Path(args.config))
-    run_upload(config=config, credentials_path=Path(args.credentials), verify=args.verify, dry_run=args.dry_run)
+    selected_date = dt.date.fromisoformat(args.date) if args.date else None
+    run_upload(config=config, credentials_path=Path(args.credentials), verify=args.verify, dry_run=args.dry_run, date=selected_date)
 
 
 if __name__ == "__main__":

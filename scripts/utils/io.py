@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import calendar
+import datetime as dt
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -13,14 +15,32 @@ def load_config(config_path: Path) -> Dict:
         return yaml.safe_load(handle)
 
 
-def iter_days(base_path: Path, years: Iterable[int], months: Iterable[int]) -> Iterable[Path]:
+def _normalize_days(days: Optional[Iterable[int] | str]) -> Optional[List[int]]:
+    if days is None:
+        return None
+    if isinstance(days, str):
+        if days.lower() == "all":
+            return None
+        raise ValueError("days must be a list of day numbers or 'all'")
+    return [int(day) for day in days]
+
+
+def iter_selected_dates(years: Iterable[int], months: Iterable[int], days: Optional[Iterable[int] | str] = None) -> Iterable[dt.date]:
+    selected_days = _normalize_days(days)
     for year in years:
         for month in months:
-            month_dir = base_path / f"{year:04d}" / f"{month:02d}"
-            if not month_dir.exists():
-                continue
-            for day_dir in sorted([item for item in month_dir.iterdir() if item.is_dir()]):
-                yield day_dir
+            _, days_in_month = calendar.monthrange(year, month)
+            month_days = range(1, days_in_month + 1) if selected_days is None else selected_days
+            for day in month_days:
+                if 1 <= day <= days_in_month:
+                    yield dt.date(year, month, day)
+
+
+def iter_days(base_path: Path, years: Iterable[int], months: Iterable[int], days: Optional[Iterable[int] | str] = None) -> Iterable[Path]:
+    for day in iter_selected_dates(years=years, months=months, days=days):
+        day_dir = base_path / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+        if day_dir.exists():
+            yield day_dir
 
 
 def _is_l1_file(path: Path, satellite: str) -> bool:

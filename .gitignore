@@ -7,3 +7,8 @@ s3_credentials.py
 
 # Outputs
 plots/
+# Profiling outputs
+*.prof
+*.prof.txt
+profile_*.prof
+*.prof.gz

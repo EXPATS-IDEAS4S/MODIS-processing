@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "/home/Daniele/codes/MODIS-processing/scripts/run_pipeline.py", line 15, in <module>
-    from download_modis import run_download
-ModuleNotFoundError: No module named 'download_modis'
